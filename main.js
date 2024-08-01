@@ -3,34 +3,57 @@ import {OrbitControls} from 'three/examples/jsm/controls/OrbitControls';
 import {Copc} from 'copc';
 import * as dat from 'dat.gui';
 
+// Custom Octree implementation
+class Octree {
+    constructor(box) {
+        this.box = box;
+        this.children = [];
+        this.nodeKey = null;
+        this.points = null;
+    }
+
+    addNode(box) {
+        const child = new Octree(box);
+        this.children.push(child);
+        return child;
+    }
+
+    traverse(callback) {
+        callback(this);
+        for (const child of this.children) {
+            child.traverse(callback);
+        }
+    }
+}
+
 let scene, camera, renderer, controls;
-let pointCloud;
-const url = "https://public-aco-data.s3.amazonaws.com/data/4012_PlaceGlacier/22_4012_03/22_4012_03_LASER_WGS84_UTM10_Ellips.copc.laz";
-// const url = "/mnt/aco-uvic/Taylor_temp/geoconnections_data/4012_PlaceGlacier/23_4012_11/23_4012_11_PlaceGlacier_LASER_WGS84_UTM10_Ellips.copc.laz";
+const url = "https://public-aco-data.s3.amazonaws.com/data/4012_PlaceGlacier/23_4012_08/23_4012_08_PlaceGlacier_LASER_WGS84_UTM10_Ellips.copc.laz";
+
 let copc;
-let nodes = {};
-let loadedNodes = new Set();
+let nodesMetadata = {};
+let visibleNodes = new Set();
 const frustum = new THREE.Frustum();
 const projScreenMatrix = new THREE.Matrix4();
+let copcOffset;
+let copcScale;
 
-// Debug variables
-let debugObjects = {};
-let gui;
 let debugParams = {
-    showBoundingBoxes: false,
-    pointSize: 0.01,
-    loadDistance: 1000,
-    pointBudget: 100000,
+    pointSize: 0.1,
+    pointBudget: 1000000,
+    showOctree: true,
 };
 
+let octreeVisualization;
+
 let totalLoadedPoints = 0;
+let octree;
+
 
 async function init() {
     console.log("Initializing...");
     scene = new THREE.Scene();
     camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 10000);
-
-    // We'll set the camera position later, after loading the point cloud
+    camera.position.set(0, 0, 100);
 
     renderer = new THREE.WebGLRenderer();
     renderer.setSize(window.innerWidth, window.innerHeight);
@@ -38,28 +61,51 @@ async function init() {
     document.body.appendChild(renderer.domElement);
 
     controls = new OrbitControls(camera, renderer.domElement);
-    controls.addEventListener('change', () => {
-        updateVisibleNodes().catch(console.error);
-    });
+    controls.addEventListener('change', updateVisibleNodes);
 
-    const axesHelper = new THREE.AxesHelper(50);
-    scene.add(axesHelper);
+    scene.add(new THREE.AxesHelper(50));
 
-    const gridHelper = new THREE.GridHelper(1000, 100);
-    scene.add(gridHelper);
-
-    console.log("Loading COPC data...");
     try {
+        console.log("Loading COPC data from URL:", url);
         copc = await Copc.create(url);
-        const {nodes: initialNodes} = await Copc.loadHierarchyPage(url, copc.info.rootHierarchyPage);
-        nodes = initialNodes;
-        console.log("COPC data loaded:", nodes);
+        console.log("COPC data loaded successfully:", copc);
 
-        // Load root node
-        await loadAndRenderNode('0-0-0-0');
+        // Extract min values for offset
+        copcOffset = new THREE.Vector3(
+            copc.info.cube[0],
+            copc.info.cube[1],
+            copc.info.cube[2]
+        );
+        console.log("COPC offset (min values):", copcOffset);
 
-        // After loading the root node, set the camera to view the point cloud
+        // Calculate scale based on the range of values
+        const range = new THREE.Vector3(
+            copc.info.cube[3] - copc.info.cube[0],
+            copc.info.cube[4] - copc.info.cube[1],
+            copc.info.cube[5] - copc.info.cube[2]
+        );
+        const maxRange = Math.max(range.x, range.y, range.z);
+        copcScale = 100 / maxRange; // Scale to fit within a 100x100x100 cube
+        console.log("COPC scale factor:", copcScale);
+
+        console.log("Building octree...");
+        octree = await buildOctree(copc.info.rootHierarchyPage);
+        console.log("Octree built successfully:", octree);
+
+        console.log("Logging octree structure:");
+        logOctreeStructure(octree);
+
+        console.log("Creating octree visualization...");
+        createOctreeVisualization(octree);
+
+        console.log("Setting camera to view point cloud...");
         setCameraToViewPointCloud();
+
+        console.log("Creating debug axes...");
+        createDebugAxes(100);
+
+        console.log("Updating visible nodes...");
+        await updateVisibleNodes();
     } catch (error) {
         console.error("Error loading COPC data:", error);
         alert("Failed to load COPC data. Check the console for details.");
@@ -69,290 +115,398 @@ async function init() {
     animate();
 }
 
-function setCameraToViewPointCloud() {
-    const rootNode = scene.getObjectByName('0-0-0-0');
-    if (rootNode && rootNode.geometry) {
-        rootNode.geometry.computeBoundingBox();
-        const box = rootNode.geometry.boundingBox;
+async function buildOctree(rootPage) {
+    console.log("Building octree from root page:", rootPage);
+    const [minX, minY, minZ, maxX, maxY, maxZ] = copc.info.cube;
+    console.log("Bounding box:", {minX, minY, minZ, maxX, maxY, maxZ});
 
-        const center = new THREE.Vector3();
-        box.getCenter(center);
-
-        const size = new THREE.Vector3();
-        box.getSize(size);
-
-        const maxDim = Math.max(size.x, size.y, size.z);
-        const fov = camera.fov * (Math.PI / 180);
-        const cameraZ = Math.abs(maxDim / 2 / Math.tan(fov / 2)) * 1.5; // 1.5 times the distance to fit the whole point cloud
-
-        camera.position.set(center.x, center.y, center.z + cameraZ);
-        camera.lookAt(center);
-        controls.target.copy(center);
-        controls.update();
-
-        console.log("Camera positioned to view point cloud");
-    } else {
-        console.warn("Root node not found or has no geometry. Using default camera position.");
-        camera.position.set(100, 100, 100);
-        camera.lookAt(scene.position);
-    }
-}
-
-
-async function loadAndRenderNode(nodeKey) {
-    if (loadedNodes.has(nodeKey)) return;
-
-    console.log(`Loading node: ${nodeKey}`);
-    const node = nodes[nodeKey];
-    console.log("Node", node)
-    const view = await Copc.loadPointDataView(url, copc, node);
-    console.log("View", view);
-
-    if (totalLoadedPoints + view.pointCount > debugParams.pointBudget) {
-        console.log(`Skipping node ${nodeKey} to stay within point budget`);
-        return;
-    }
-
-    const positions = new Float32Array(view.pointCount * 3);
-    const colors = new Float32Array(view.pointCount * 3);
-
-    const getX = view.getter('X');
-    const getY = view.getter('Y');
-    const getZ = view.getter('Z');
-    const getIntensity = view.getter('Intensity');
-
-    let minX = Infinity, minY = Infinity, minZ = Infinity;
-    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
-    for (let i = 0; i < view.pointCount; i++) {
-        const x = getX(i);
-        const y = getY(i);
-        const z = getZ(i);
-        positions[i * 3] = x;
-        positions[i * 3 + 1] = y;
-        positions[i * 3 + 2] = z;
-
-        minX = Math.min(minX, x);
-        minY = Math.min(minY, y);
-        minZ = Math.min(minZ, z);
-        maxX = Math.max(maxX, x);
-        maxY = Math.max(maxY, y);
-        maxZ = Math.max(maxZ, z);
-
-        const intensity = getIntensity(i) / 65535;
-        colors[i * 3] = colors[i * 3 + 1] = colors[i * 3 + 2] = intensity;
-    }
-    console.log("Positions", positions)
-    const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-
-    const material = new THREE.PointsMaterial({
-        size: debugParams.pointSize,
-        vertexColors: true
-    });
-    const points = new THREE.Points(geometry, material);
-    console.log(points)
-    points.name = nodeKey;
-
-    scene.add(points);
-    console.log("Points added to scene")
-    loadedNodes.add(nodeKey);
-    totalLoadedPoints += view.pointCount;
-    console.log("Loaded nodes updated")
-
-    // Add bounding box
-    console.log("Adding bounding box");
-    const box = new THREE.Box3(
+    const boundingBox = new THREE.Box3(
         new THREE.Vector3(minX, minY, minZ),
         new THREE.Vector3(maxX, maxY, maxZ)
     );
-    console.log("Box", box);
-    const boxHelper = new THREE.Box3Helper(box, 0xffff00);
-    boxHelper.name = `bbox_${nodeKey}`;
-    boxHelper.visible = debugParams.showBoundingBoxes;
-    console.log("Box Helper", boxHelper);
-    scene.add(boxHelper);
+    console.log("Bounding box:", boundingBox);
 
-    console.log(`Node ${nodeKey} loaded with ${view.pointCount} points`);
+    const octree = new Octree(boundingBox);
+
+    // Load only the root node "0-0-0-0"
+    const {nodes} = await Copc.loadHierarchyPage(url, rootPage);
+    const rootKey = "0-0-0-0";
+    const rootNode = nodes[rootKey];
+
+    if (rootNode) {
+        const box = await calculateNodeBounds(rootNode);
+        const octreeNode = octree.addNode(box);
+        octreeNode.nodeKey = rootKey;
+        nodesMetadata[rootKey] = {node: rootNode, octreeNode};
+        console.log(`Added root node ${rootKey} to octree: min=${box.min.toArray()}, max=${box.max.toArray()}`);
+    } else {
+        console.warn("Root node '0-0-0-0' not found in the hierarchy page");
+    }
+
+    console.log("Octree built with root node:", octree);
+    return octree;
 }
+
+function createOctreeVisualization(octree) {
+    octreeVisualization = new THREE.Group();
+
+    function addBoxToVisualization(node) {
+        const box = node.box;
+        const size = new THREE.Vector3();
+        box.getSize(size);
+
+        const geometry = new THREE.BoxGeometry(size.x, size.y, size.z);
+        const material = new THREE.LineBasicMaterial({
+            color: 0x00ff00,
+            transparent: true,
+            opacity: 0.5
+        });
+        const wireframe = new THREE.LineSegments(new THREE.WireframeGeometry(geometry), material);
+
+        const center = new THREE.Vector3();
+        box.getCenter(center);
+        wireframe.position.copy(center);
+
+        octreeVisualization.add(wireframe);
+        console.log(`Added octree box: center=${center.toArray()}, size=${size.toArray()}`);
+    }
+
+    octree.traverse(addBoxToVisualization);
+    scene.add(octreeVisualization);
+}
+
+function updateOctreeVisibility() {
+    if (octreeVisualization) {
+        octreeVisualization.visible = debugParams.showOctree;
+    }
+}
+
+
+async function loadHierarchyPageRecursive(pageNumber, parentOctreeNode) {
+    console.log(`Loading hierarchy page ${pageNumber}`);
+    try {
+        const {nodes, children} = await Copc.loadHierarchyPage(url, pageNumber);
+        console.log(`Page ${pageNumber} loaded:`, {
+            nodeCount: Object.keys(nodes).length,
+            childrenCount: children ? children.length : 0
+        });
+
+        for (const [key, node] of Object.entries(nodes)) {
+            const box = await calculateNodeBounds(node);
+            const octreeNode = parentOctreeNode.addNode(box);
+            octreeNode.nodeKey = key;
+            nodesMetadata[key] = {node, octreeNode};
+            console.log(`Added node ${key} to octree: min=${box.min.toArray()}, max=${box.max.toArray()}`);
+        }
+
+        if (children && Array.isArray(children)) {
+            for (const childPage of children) {
+                await loadHierarchyPageRecursive(childPage, parentOctreeNode);
+            }
+        }
+    } catch (error) {
+        console.error(`Error loading hierarchy page ${pageNumber}:`, error);
+    }
+}
+
+async function calculateNodeBounds(node) {
+    try {
+        const view = await Copc.loadPointDataView(url, copc, node);
+        const getX = view.getter('X');
+        const getY = view.getter('Y');
+        const getZ = view.getter('Z');
+
+        let minX = Infinity, minY = Infinity, minZ = Infinity;
+        let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+
+        for (let i = 0; i < view.pointCount; i++) {
+            const x = getX(i);
+            const y = getY(i);
+            const z = getZ(i);
+
+            minX = Math.min(minX, x);
+            minY = Math.min(minY, y);
+            minZ = Math.min(minZ, z);
+            maxX = Math.max(maxX, x);
+            maxY = Math.max(maxY, y);
+            maxZ = Math.max(maxZ, z);
+        }
+
+        return new THREE.Box3(
+            new THREE.Vector3(minX, minY, minZ),
+            new THREE.Vector3(maxX, maxY, maxZ)
+        );
+    } catch (error) {
+        console.error(`Error calculating bounds for node:`, error);
+        // Return a default box in case of error
+        return new THREE.Box3(
+            new THREE.Vector3(-1, -1, -1),
+            new THREE.Vector3(1, 1, 1)
+        );
+    }
+}
+
 
 function unloadNode(nodeKey) {
-    console.log(`Unloading node: ${nodeKey}`);
-    const object = scene.getObjectByName(nodeKey);
-    if (object) {
-        totalLoadedPoints -= object.geometry.attributes.position.count; // New: Update total loaded points
-        scene.remove(object);
-        object.geometry.dispose();
-        object.material.dispose();
+    console.log(`Attempting to unload node ${nodeKey}`);
+    const metadata = nodesMetadata[nodeKey];
+    if (!metadata) {
+        console.warn(`No metadata found for node ${nodeKey}`);
+        return;
     }
-    const boxHelper = scene.getObjectByName(`bbox_${nodeKey}`);
-    if (boxHelper) {
-        scene.remove(boxHelper);
+
+    const {octreeNode} = metadata;
+    if (!octreeNode) {
+        console.warn(`No octree node found for node ${nodeKey}`);
+        return;
     }
-    loadedNodes.delete(nodeKey);
+
+    if (octreeNode.points) {
+        console.log(`Unloading points for node ${nodeKey}`);
+        scene.remove(octreeNode.points);
+        if (octreeNode.points.geometry) {
+            octreeNode.points.geometry.dispose();
+        }
+        if (octreeNode.points.material) {
+            octreeNode.points.material.dispose();
+        }
+        totalLoadedPoints -= octreeNode.points.geometry ? octreeNode.points.geometry.attributes.position.count : 0;
+        octreeNode.points = null;
+    } else {
+        console.warn(`No points object found for node ${nodeKey}`);
+    }
+
+    visibleNodes.delete(nodeKey);
+    console.log(`Node ${nodeKey} unloaded. Total loaded points: ${totalLoadedPoints}`);
 }
 
+async function loadAndRenderNode(nodeKey) {
+    console.log(`Attempting to load and render node ${nodeKey}`);
+    if (visibleNodes.has(nodeKey)) {
+        console.log(`Node ${nodeKey} is already visible, skipping`);
+        return;
+    }
+
+    const metadata = nodesMetadata[nodeKey];
+    if (!metadata) {
+        console.warn(`No metadata found for node ${nodeKey}`);
+        return;
+    }
+
+    const {node, octreeNode} = metadata;
+    if (!node) {
+        console.warn(`Node ${nodeKey} not found in hierarchy`);
+        return;
+    }
+
+    try {
+        console.log(`Loading point data for node ${nodeKey}`);
+        const view = await Copc.loadPointDataView(url, copc, node);
+        console.log(`Point data loaded for node ${nodeKey}, point count:`, view.pointCount);
+
+        const positions = new Float32Array(view.pointCount * 3);
+        const colors = new Float32Array(view.pointCount * 3);
+
+        const getters = ['X', 'Y', 'Z', 'Red', 'Green', 'Blue'].map(view.getter);
+
+        for (let i = 0; i < view.pointCount; i++) {
+            let [x, y, z, r, g, b] = getters.map(getter => getter(i));
+
+            positions[i * 3] = x;
+            positions[i * 3 + 1] = y;
+            positions[i * 3 + 2] = z;
+
+            if (i < 10) {
+                console.log(`Point ${i}: x=${x}, y=${y}, z=${z}, r=${r}, g=${g}, b=${b}`);
+            }
+
+            colors[i * 3] = r / 65535;
+            colors[i * 3 + 1] = g / 65535;
+            colors[i * 3 + 2] = b / 65535;
+        }
+
+        const geometry = new THREE.BufferGeometry();
+        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+        const material = new THREE.PointsMaterial({
+            size: debugParams.pointSize,
+            vertexColors: true,
+            sizeAttenuation: false
+        });
+
+        const points = new THREE.Points(geometry, material);
+        octreeNode.points = points;
+        scene.add(points);
+
+        visibleNodes.add(nodeKey);
+        totalLoadedPoints += view.pointCount;
+
+        console.log(`Node ${nodeKey} rendered with ${view.pointCount} points`);
+    } catch (error) {
+        console.error(`Error loading node ${nodeKey}:`, error);
+    }
+}
 
 async function updateVisibleNodes() {
+    console.log("Updating visible nodes...");
     camera.updateMatrixWorld();
     projScreenMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
     frustum.setFromProjectionMatrix(projScreenMatrix);
 
-    const visibleNodes = new Set();
-    const nodesToLoad = new Set();
-    const nodesToUnload = new Set(loadedNodes);
+    const nodesToLoad = [];
+    const nodesToUnload = new Set(visibleNodes);
 
-    for (const nodeKey in nodes) {
-        const node = nodes[nodeKey];
+    let totalNodes = 0;
+    let intersectingNodes = 0;
 
-        // Calculate bounding box for the node
-        let box;
-        if (loadedNodes.has(nodeKey)) {
-            const points = scene.getObjectByName(nodeKey);
-            if (points && points.geometry) {
-                points.geometry.computeBoundingBox();
-                box = points.geometry.boundingBox.clone();
-            }
-        } else {
-            // If the node isn't loaded, we need to load its data to calculate the bounding box
-            const view = await Copc.loadPointDataView(url, copc, node);
-            const getX = view.getter('X');
-            const getY = view.getter('Y');
-            const getZ = view.getter('Z');
-
-            let minX = Infinity, minY = Infinity, minZ = Infinity;
-            let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
-
-            for (let i = 0; i < view.pointCount; i++) {
-                const x = getX(i);
-                const y = getY(i);
-                const z = getZ(i);
-
-                minX = Math.min(minX, x);
-                minY = Math.min(minY, y);
-                minZ = Math.min(minZ, z);
-                maxX = Math.max(maxX, x);
-                maxY = Math.max(maxY, y);
-                maxZ = Math.max(maxZ, z);
-            }
-
-            box = new THREE.Box3(
-                new THREE.Vector3(minX, minY, minZ),
-                new THREE.Vector3(maxX, maxY, maxZ)
-            );
-        }
-
-        if (box && frustum.intersectsBox(box)) {
-            visibleNodes.add(nodeKey);
-            nodesToUnload.delete(nodeKey);
-
-            const distance = camera.position.distanceTo(box.getCenter(new THREE.Vector3()));
-            const screenSize = getScreenSize(box, camera);
-
-            if (screenSize > 100 && node.children && node.children.length > 0 && distance < debugParams.loadDistance) {
-                node.children.forEach(childKey => nodesToLoad.add(childKey));
-            } else if (!loadedNodes.has(nodeKey) && distance < debugParams.loadDistance) {
-                nodesToLoad.add(nodeKey);
+    octree.traverse((octreeNode) => {
+        totalNodes++;
+        if (frustum.intersectsBox(octreeNode.box)) {
+            intersectingNodes++;
+            if (octreeNode.nodeKey) {
+                nodesToUnload.delete(octreeNode.nodeKey);
+                if (!visibleNodes.has(octreeNode.nodeKey)) {
+                    nodesToLoad.push(octreeNode.nodeKey);
+                }
             }
         }
+    });
+
+    console.log(`Total nodes in octree: ${totalNodes}`);
+    console.log(`Nodes intersecting frustum: ${intersectingNodes}`);
+    console.log(`Nodes to unload: ${nodesToUnload.size}, Nodes to load: ${nodesToLoad.length}`);
+
+    // Unload nodes that are no longer visible
+    for (const nodeKey of nodesToUnload) {
+        unloadNode(nodeKey);
     }
 
-    console.log(`Visible nodes: ${visibleNodes.size}, To load: ${nodesToLoad.size}, To unload: ${nodesToUnload.size}`);
-
+    // Load new visible nodes
     for (const nodeKey of nodesToLoad) {
         if (totalLoadedPoints < debugParams.pointBudget) {
             await loadAndRenderNode(nodeKey);
         } else {
-            break; // Stop loading new nodes if we've reached the point budget
+            console.log(`Point budget reached, stopping at ${totalLoadedPoints} points`);
+            break;
         }
     }
-    nodesToUnload.forEach(nodeKey => unloadNode(nodeKey));
+
+    console.log(`Total loaded points: ${totalLoadedPoints}`);
+    console.log("Camera position:", camera.position);
+    console.log("Camera lookAt:", controls.target);
 }
 
-function getScreenSize(box, camera) {
-    const size = box.getSize(new THREE.Vector3());
-    const center = box.getCenter(new THREE.Vector3());
-    const distance = camera.position.distanceTo(center);
-    const fov = camera.fov * Math.PI / 180;
-    const height = 2 * Math.tan(fov / 2) * distance;
-    return (size.length() / height) * window.innerHeight;
-}
 
-async function animate() {
-    requestAnimationFrame(animate);
+function setCameraToViewPointCloud() {
+    const boundingBox = octree.box;
+    const center = new THREE.Vector3();
+    boundingBox.getCenter(center);
+    const size = new THREE.Vector3();
+    boundingBox.getSize(size);
+
+    const maxDim = Math.max(size.x, size.y, size.z);
+    const fov = camera.fov * (Math.PI / 180);
+    const cameraZ = Math.abs(maxDim / 2 / Math.tan(fov / 2)) * 1.5;
+
+    camera.position.set(center.x, center.y, center.z + cameraZ);
+    controls.target.copy(center);
+    camera.lookAt(controls.target);
     controls.update();
-    await updateVisibleNodes();
-    renderer.render(scene, camera);
 
-    // Update debug info
-    debugObjects.cameraInfo.innerHTML = `
-        Camera Position: ${camera.position.x.toFixed(2)}, ${camera.position.y.toFixed(2)}, ${camera.position.z.toFixed(2)}
-        Camera Look At: ${controls.target.x.toFixed(2)}, ${controls.target.y.toFixed(2)}, ${controls.target.z.toFixed(2)}
-        Loaded Nodes: ${loadedNodes.size}
-    `;
+    camera.near = maxDim * 0.00001;
+    camera.far = maxDim * 10;
+    camera.updateProjectionMatrix();
+
+    console.log("Bounding box center:", center);
+    console.log("Bounding box size:", size);
+    console.log("Camera set to:", camera.position);
+    console.log("Camera looking at:", controls.target);
+    console.log("Camera near plane:", camera.near);
+    console.log("Camera far plane:", camera.far);
+
+    // Add a debug sphere at the camera's target
+    const debugSphere = new THREE.Mesh(
+        new THREE.SphereGeometry(maxDim * 0.01, 32, 32),
+        new THREE.MeshBasicMaterial({color: 0x00ff00})
+    );
+    debugSphere.position.copy(controls.target);
+    scene.add(debugSphere);
+}
+
+function createDebugAxes(size) {
+    const axes = new THREE.AxesHelper(size);
+    scene.add(axes);
+}
+
+
+function debugNode(nodeKey) {
+    const metadata = nodesMetadata[nodeKey];
+    if (!metadata) {
+        console.warn(`No metadata found for node ${nodeKey}`);
+        return;
+    }
+
+    const {node, octreeNode} = metadata;
+    console.log(`Debug info for node ${nodeKey}:`);
+    console.log("Node:", node);
+    console.log("Octree node:", octreeNode);
+    console.log("Bounding box:", octreeNode.box);
+    console.log("Is visible:", visibleNodes.has(nodeKey));
+    console.log("Intersects frustum:", frustum.intersectsBox(octreeNode.box));
+}
+
+function logOctreeStructure(octree, depth = 0) {
+    const indent = '  '.repeat(depth);
+    console.log(`${indent}Node: ${octree.nodeKey || 'root'}`);
+    console.log(`${indent}Box: min=${octree.box.min.toArray()}, max=${octree.box.max.toArray()}`);
+    console.log(`${indent}Children: ${octree.children.length}`);
+    for (const child of octree.children) {
+        logOctreeStructure(child, depth + 1);
+    }
 }
 
 
 function setupDebugGUI() {
-    gui = new dat.GUI();
-    gui.add(debugParams, 'showBoundingBoxes').onChange(value => {
-        scene.traverse(object => {
-            if (object.name.startsWith('bbox_')) {
-                object.visible = value;
-            }
-        });
-    });
-    gui.add(debugParams, 'pointSize', 0.001, 0.1).onChange(value => {
-        scene.traverse(object => {
+    const gui = new dat.GUI();
+    gui.add(debugParams, 'pointSize', 0.001, 0.1).onChange((value) => {
+        scene.traverse((object) => {
             if (object instanceof THREE.Points) {
                 object.material.size = value;
             }
         });
     });
-    gui.add(debugParams, 'loadDistance', 100, 10000);
-    gui.add(debugParams, 'pointBudget', 10000, 1000000).step(10000).onChange(value => {
-        console.log(`Point budget changed to ${value}`);
-        updateVisibleNodes(); // Trigger an update when the point budget changes
-    });
-    // Add camera position controls
-    const cameraFolder = gui.addFolder('Camera');
-    cameraFolder.add(camera.position, 'x', -1000, 1000);
-    cameraFolder.add(camera.position, 'y', -1000, 1000);
-    cameraFolder.add(camera.position, 'z', -1000, 1000);
-
-    // Add a button to reset the camera
-    gui.add({
-        resetCamera: function () {
-            camera.position.set(100, 100, 100);
-            camera.lookAt(scene.position);
-            controls.target.set(0, 0, 0);
-            controls.update();
-        }
-    }, 'resetCamera').name('Reset Camera');
-
-    // Add debug info div
-    const debugInfo = document.createElement('div');
-    debugInfo.style.position = 'absolute';
-    debugInfo.style.top = '10px';
-    debugInfo.style.left = '10px';
-    debugInfo.style.color = 'white';
-    debugInfo.style.backgroundColor = 'rgba(0,0,0,0.5)';
-    debugInfo.style.padding = '10px';
-    debugInfo.style.fontFamily = 'monospace';
-    debugInfo.style.fontSize = '12px';
-    debugInfo.style.pointerEvents = 'none';
-    console.log("Created debug info div")
-    document.body.appendChild(debugInfo);
-    debugObjects.cameraInfo = debugInfo;
-
-    debugObjects.cameraInfo.innerHTML = `
-        Camera Position: ${camera.position.x.toFixed(2)}, ${camera.position.y.toFixed(2)}, ${camera.position.z.toFixed(2)}
-        Camera Look At: ${controls.target.x.toFixed(2)}, ${controls.target.y.toFixed(2)}, ${controls.target.z.toFixed(2)}
-        Loaded Nodes: ${loadedNodes.size}
-        Total Points: ${totalLoadedPoints} / ${debugParams.pointBudget}
-    `;
+    gui.add(debugParams, 'pointBudget', 100000, 10000000).step(100000).onChange(updateVisibleNodes);
+    gui.add(debugParams, 'showOctree').onChange(updateOctreeVisibility);
+    gui.add({togglePoints: togglePointVisibility}, 'togglePoints').name('Toggle Points');
 }
 
+function togglePointVisibility() {
+    scene.traverse((object) => {
+        if (object instanceof THREE.Points) {
+            object.visible = !object.visible;
+        }
+    });
+    console.log("Toggled point visibility");
+}
+
+
+function animate() {
+    requestAnimationFrame(animate);
+    controls.update();
+    // updateVisibleNodes();
+
+    // Log camera position and lookAt every 100 frames
+    if (animate.frameCount % 100 === 0) {
+        console.log("Camera position:", camera.position);
+        console.log("Camera lookAt:", controls.target);
+    }
+    animate.frameCount = (animate.frameCount || 0) + 1;
+
+    renderer.render(scene, camera);
+}
+
+console.log("Script loaded, calling init()");
 init();
 
 window.addEventListener('resize', () => {
