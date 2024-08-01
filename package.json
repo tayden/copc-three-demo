@@ -1,0 +1,22 @@
+{
+  "name": "copc",
+  "module": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "vite dev"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "@loaders.gl/core": "^4.2.2",
+    "@loaders.gl/las": "^4.2.2",
+    "copc": "^0.0.6",
+    "dat.gui": "^0.7.9",
+    "three": "^0.167.1",
+    "vite": "^5.3.5"
+  }
+}
