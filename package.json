@@ -3,10 +3,14 @@
   "module": "index.js",
   "type": "module",
   "scripts": {
-    "start": "vite dev"
+    "start": "vite dev",
+    "build": "vite build",
+    "preview": "vite preview",
+    "deploy": "gh-pages -d dist --remote origin"
   },
   "devDependencies": {
-    "@types/bun": "latest"
+    "@types/bun": "latest",
+    "gh-pages": "^6.2.0"
   },
   "peerDependencies": {
     "typescript": "^5.0.0"
